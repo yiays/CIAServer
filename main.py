@@ -7,19 +7,22 @@ import glob
 import os
 import base64
 import webbrowser
+import socket
+import json
 from io import BytesIO
 from urllib import parse
 import asyncio
 from aiohttp import web
 import aiofiles
-from tqdm import tqdm
 import qrcode
 
 qrcodes: dict[str, str] = {}
+progress: dict[str, float] = {}
 
-indexpage = """<!DOCTYPE html>
+INDEX_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CIAServer</title>
 
     <style>
@@ -58,8 +61,18 @@ indexpage = """<!DOCTYPE html>
             border-radius: 4rem;
             padding: 4rem;
         }
+        .qr img {
+            opacity: 0.125;
+            transition: opacity 0.3s;
+        }
+        .qr:hover img {
+            opacity: 1;
+        }
         .qr h2 {
             margin: 0;
+        }
+        .qr progress {
+            width: 100%;
         }
     </style>
 </head>
@@ -70,12 +83,26 @@ indexpage = """<!DOCTYPE html>
     </p>
     <p>
         Any 2DS/3DS/N2DS/N3DS connected to the same WiFi network should be able to scan these QR
-        codes and install software via FBI <i>(In Scan QR Code mode)</i>.
+        codes and install software via FBI <i>(In Scan QR Code mode)</i>. Hover over a QR code to
+        make it easier to scan.
     </p>
     <main>
         {{content}}
     </main>
-</body>"""
+</body>
+<script>
+    function getProgress() {
+        fetch("/progress").then(data => data.json()).then(updateProgress);
+    }
+
+    function updateProgress(data) {
+        for (const [file, progress] of Object.entries(data)) {
+            document.querySelector(`progress[data-file="${file}"]`).value = progress * 100;
+        }
+    }
+
+    setInterval(getProgress, 1000);
+</script>"""
 
 async def file_sender(file_path):
     """
@@ -83,7 +110,7 @@ async def file_sender(file_path):
     """
     chunk_size = 2 ** 16
     file_size = os.path.getsize(file_path)
-    progress = tqdm(desc=file_path, unit="bytes", unit_scale=True, total=file_size)
+    total_sent = 0
 
     async with aiofiles.open(file_path, 'rb') as f:
         while True:
@@ -91,28 +118,28 @@ async def file_sender(file_path):
             if not chunk:
                 break
             yield chunk
-            progress.update(len(chunk))
+            total_sent += len(chunk)
+            progress[file_path] = total_sent / file_size
 
 async def get_cia(request:web.Request):
     """ Respond to GET requests with the rom file """
-    headers = {
-        "Content-disposition": f"attachment; filename={request.path[1:]}",
-        "content-type":"application/zip",
-        "accept-ranges":"bytes",
-        "content-length":str(os.path.getsize(request.path[1:]))
-    }
+    file = request.path[1:]
 
-    if not os.path.exists(request.path[1:]):
-        return web.Response(
-            body=f"File <{request.path[1:]}> does not exist",
-            status=404
-        )
+    if not os.path.exists(file):
+        return web.Response(body=f"File ({file}) does not exist", status=404)
+
+    headers = {
+        "Content-disposition": f"attachment; filename={file}",
+        "content-type":"application/octet-stream",
+        "accept-ranges":"bytes"
+    }
 
     response = web.StreamResponse(headers=headers)
     response.enable_chunked_encoding()
+    response.headers.add('content-length', str(os.path.getsize(file)))
 
     async def stream_file():
-        async for chunk in file_sender(request.path[1:]):
+        async for chunk in file_sender(file):
             await response.write(chunk)
 
     await response.prepare(request)
@@ -120,21 +147,28 @@ async def get_cia(request:web.Request):
 
     return response
 
-async def get_home(request:web.Request):
-    headers = {
-        'content-type': 'text/html'
-    }
+async def get_home(_:web.Request):
+    """ Generates an html document full of all generated QR codes """
+    headers = {'content-type': 'text/html; charset=utf-8'}
     content = '\n'.join(
         (f"""
         <div class="qr">
-            <img src="data:image/png;base64,{data}">
+            <img src="data:image/png;base64,{data}" alt="QR code that downloads {file}">
             <h2>{file}</h2>
+            <progress data-file="{file}" value="0" max="100"></progress>
         </div>""" for file,data in qrcodes.items())
     )
     return web.Response(
-        body=indexpage.replace('{{content}}', content),
+        body=INDEX_PAGE.replace('{{content}}', content),
         headers=headers
     )
+
+async def get_progress(_:web.Request):
+    headers = {'content-type': 'application/json; charset=utf-8',
+               'cache-control': 'no-cache',
+               'x-content-type-options': 'nosniff'}
+    content = json.dumps(progress)
+    return web.Response(body=content, headers=headers)
 
 async def main():
     """ Main loop """
@@ -142,6 +176,7 @@ async def main():
 
     app=web.Application()
     # Find rom files and create routes
+    #TODO: add support for noticing changes to the working directory
     roms=[]
     for typ in ['*.cia','*.3dsx']:
         result=glob.glob(typ)
@@ -149,6 +184,7 @@ async def main():
             roms+=result
     app.add_routes([web.get('/'+parse.quote_plus(f).replace('+','%20'),get_cia) for f in roms])
     app.router.add_get('/', get_home)
+    app.router.add_get('/progress', get_progress)
 
     if len(roms)<=0:
         print('error: please place .cia files in the same directory as this script before running!')
@@ -158,16 +194,18 @@ async def main():
           'and find the scan qr code option now.\n')
 
     ip='0.0.0.0'
-    client_ip = 'localhost'
     if os.path.exists('ip override.txt'):
         with open('ip override.txt','r',encoding='ascii') as f:
             ip=f.read()
-            client_ip = ip
         print('Manually set IP address is '+ip)
         print("If this appears invalid, you can delete",
               "'ip override.txt' to automatically determine the ip.\n")
+    else:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
 
-    print('starting web server at '+ip+':8888...')
+    print('Starting web server at '+ip+':8888...')
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -178,15 +216,15 @@ async def main():
         print("ERROR: Failed to start the webserver!",
               "Try changing your ip settings by editing or deleting the 'ip override.txt' file.")
         return
-    print(f'Web server running at http://{client_ip}:8888 !\n')
+    print(f'Web server running at http://{ip}:8888 !\n')
 
-    qrcodes = dict((f, generate_qr(f, client_ip)) for f in roms)
+    qrcodes = dict((f, generate_qr(f, ip)) for f in roms)
 
     print("\nDone! Scan each of these qr codes with each cracked 3ds you want them installed on!")
     print('Keep this window open in order to keep the transmission running.')
     print('You can transfer multiple apps to multiple cracked 3dses at once.')
 
-    webbrowser.open('http://localhost:8888')
+    webbrowser.open(f'http://{ip}:8888')
 
 def generate_qr(file, ip):
     """ Create a QR as a Base64 encoded PNG """

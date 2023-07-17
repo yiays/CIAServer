@@ -1,5 +1,4 @@
 aiohttp
 aiofiles
 qrcode
-tqdm
 cx-freeze
