@@ -5,14 +5,18 @@
 from cx_Freeze import setup, Executable
 
 # Dependencies are automatically detected, but it might need fine tuning.
-buildOptions = dict(packages = ['asyncio','idna','aiohttp','appdirs','packaging'], excludes = [])
+buildOptions = {
+    'packages': [],
+    'includes': [],
+    'excludes': []
+}
 
 executables = [
-    Executable('main.py', base='Console', targetName = 'CIAServer.exe')
+    Executable('main.py', base='Console', target_name = 'CIAServer.exe')
 ]
 
 setup(name='CIAServer.exe',
       version = '1.2',
       description = 'Serve your cia and 3dsx files directly to FBI via remote install',
-      options = dict(build_exe = buildOptions),
+      options = {'build_exe': buildOptions},
       executables = executables)

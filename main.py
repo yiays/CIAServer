@@ -164,6 +164,7 @@ async def get_home(_:web.Request):
     )
 
 async def get_progress(_:web.Request):
+    """ Respond with a JSON object showing file transfer progress """
     headers = {'content-type': 'application/json; charset=utf-8',
                'cache-control': 'no-cache',
                'x-content-type-options': 'nosniff'}
@@ -193,42 +194,42 @@ async def main():
     print('Open your homebrew software manager of choice (FBI) on your device',
           'and find the scan qr code option now.\n')
 
-    ip='0.0.0.0'
+    ip_addr='0.0.0.0'
     if os.path.exists('ip override.txt'):
         with open('ip override.txt','r',encoding='ascii') as f:
-            ip=f.read()
-        print('Manually set IP address is '+ip)
+            ip_addr=f.read()
+        print('Manually set IP address is '+ip_addr)
         print("If this appears invalid, you can delete",
               "'ip override.txt' to automatically determine the ip.\n")
     else:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
+            ip_addr = s.getsockname()[0]
 
-    print('Starting web server at '+ip+':8888...')
+    print('Starting web server at '+ip_addr+':8888...')
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, ip, 8888)
+    site = web.TCPSite(runner, ip_addr, 8888)
     try:
         await site.start()
     except OSError:
         print("ERROR: Failed to start the webserver!",
               "Try changing your ip settings by editing or deleting the 'ip override.txt' file.")
         return
-    print(f'Web server running at http://{ip}:8888 !\n')
+    print(f'Web server running at http://{ip_addr}:8888 !\n')
 
-    qrcodes = dict((f, generate_qr(f, ip)) for f in roms)
+    qrcodes = dict((f, generate_qr(f, ip_addr)) for f in roms)
 
     print("\nDone! Scan each of these qr codes with each cracked 3ds you want them installed on!")
     print('Keep this window open in order to keep the transmission running.')
     print('You can transfer multiple apps to multiple cracked 3dses at once.')
 
-    webbrowser.open(f'http://{ip}:8888')
+    webbrowser.open(f'http://{ip_addr}:8888')
 
-def generate_qr(file, ip):
+def generate_qr(file, ip_addr):
     """ Create a QR as a Base64 encoded PNG """
-    url = 'http://'+ip+':8888/'+parse.quote_plus(file).replace('+','%20')
+    url = 'http://'+ip_addr+':8888/'+parse.quote_plus(file).replace('+','%20')
     print('Hosting rom at '+url+'...\n')
 
     qr = qrcode.QRCode(border=0)
