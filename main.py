@@ -16,8 +16,24 @@ from aiohttp import web
 import aiofiles
 import qrcode
 
-qrcodes: dict[str, str] = {}
-progress: dict[str, float] = {}
+class RomFile:
+    """ A RomFile holds all state information for real ROM files found in the cwd """
+    file: str
+    qrcode: str
+    progress: float
+
+    def __init__(self, file: str):
+        self.file = file
+        self.progress = 0
+
+class RomFileEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, RomFile):
+            return obj.__dict__
+        return super().default(obj)
+
+ip_addr: str
+romfiles: dict[str, RomFile] = dict()
 
 INDEX_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -60,6 +76,7 @@ INDEX_PAGE = """<!DOCTYPE html>
             color: #000;
             border-radius: 4rem;
             padding: 4rem;
+            padding-bottom: 2rem;
         }
         .qr img {
             opacity: 0.125;
@@ -77,7 +94,7 @@ INDEX_PAGE = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>Your CIAServer is running!</h1>
+    <h1 id="status">Your CIAServer is running!</h1>
     <p class="lead">
         Keep the terminal window open to keep the server online.
     </p>
@@ -86,28 +103,74 @@ INDEX_PAGE = """<!DOCTYPE html>
         codes and install software via FBI <i>(In Scan QR Code mode)</i>. Hover over a QR code to
         make it easier to scan.
     </p>
-    <main>
-        {{content}}
-    </main>
+    <main id="qrlist"></main>
 </body>
 <script>
+    const statusText = document.getElementById('status');
+    const qrList = document.getElementById('qrlist');
+
     function getProgress() {
-        fetch("/progress").then(data => data.json()).then(updateProgress);
+        fetch("/progress")
+            .then(data => data.json())
+            .then(updateProgress)
+            .catch(error => {
+                console.error(error.message);
+                statusText.innerText = "Your CIAServer has stopped running!";
+                qrList.innerHTML = '';
+                clearTimeout(progressService);
+            });
     }
 
+    let listedFiles = [];
     function updateProgress(data) {
-        for (const [file, progress] of Object.entries(data)) {
-            document.querySelector(`progress[data-file="${file}"]`).value = progress * 100;
+        let relistedFiles = [];
+        for (const {file, qrcode, progress} of data) {
+            relistedFiles.push(file);
+            if(listedFiles.indexOf(file) === -1) {
+                let qrDiv = document.createElement('div');
+                qrDiv.classList.add('qr');
+                qrDiv.setAttribute('data-file', file);
+
+                let qrImg = document.createElement('img');
+                qrImg.src = `data:image/png;base64,${qrcode}`;
+                qrImg.alt = `QR code that downloads ${file}`;
+                qrDiv.appendChild(qrImg);
+
+                let qrH2 = document.createElement('h2');
+                qrH2.textContent = file;
+                qrDiv.appendChild(qrH2);
+
+                qrProgress = document.createElement('progress');
+                qrProgress.setAttribute('data-file', file);
+                qrProgress.value = progress * 100;
+                qrProgress.max = 100;
+                qrDiv.appendChild(qrProgress);
+
+                qrList.appendChild(qrDiv);
+
+                listedFiles.push(file);
+            } else {
+                document.querySelector(`progress[data-file="${file}"]`).value = progress * 100;
+            }
         }
+        for (file of listedFiles) {
+            if(relistedFiles.indexOf(file) === -1) {
+                document.querySelector(`.qr[data-file="${file}"]`).remove();
+                listedFiles.splice(listedFiles.indexOf(file), 1);
+            }
+        }
+        progressService = setTimeout(getProgress, 1000);
     }
 
-    setInterval(getProgress, 1000);
+    let progressService = setTimeout(getProgress, 1000);
 </script>"""
 
 async def file_sender(file_path):
     """
     Streams files without loading into memory
     """
+    global romfiles
+
     chunk_size = 2 ** 16
     file_size = os.path.getsize(file_path)
     total_sent = 0
@@ -119,47 +182,42 @@ async def file_sender(file_path):
                 break
             yield chunk
             total_sent += len(chunk)
-            progress[file_path] = total_sent / file_size
+            romfiles[file_path].progress = total_sent / file_size
 
 async def get_cia(request:web.Request):
     """ Respond to GET requests with the rom file """
     file = request.path[1:]
+    print(f"Serving {file}...")
 
     if not os.path.exists(file):
         return web.Response(body=f"File ({file}) does not exist", status=404)
 
     headers = {
-        "Content-disposition": f"attachment; filename={file}",
+        "Content-disposition": f"attachment; filename={file.replace(',','_')}",
         "content-type":"application/octet-stream",
-        "accept-ranges":"bytes"
+        "accept-ranges":"bytes",
+        "content-length": str(os.path.getsize(file))
     }
 
     response = web.StreamResponse(headers=headers)
-    response.enable_chunked_encoding()
-    response.headers.add('content-length', str(os.path.getsize(file)))
-
     async def stream_file():
         async for chunk in file_sender(file):
             await response.write(chunk)
 
-    await response.prepare(request)
-    await stream_file()
+    try:
+        await response.prepare(request)
+        await stream_file()
+    except ConnectionResetError:
+        print("Connection aborted: other end cancelled.")
+        return
 
     return response
 
 async def get_home(_:web.Request):
     """ Generates an html document full of all generated QR codes """
     headers = {'content-type': 'text/html; charset=utf-8'}
-    content = '\n'.join(
-        (f"""
-        <div class="qr">
-            <img src="data:image/png;base64,{data}" alt="QR code that downloads {file}">
-            <h2>{file}</h2>
-            <progress data-file="{file}" value="0" max="100"></progress>
-        </div>""" for file,data in qrcodes.items())
-    )
     return web.Response(
-        body=INDEX_PAGE.replace('{{content}}', content),
+        body=INDEX_PAGE,
         headers=headers
     )
 
@@ -168,33 +226,39 @@ async def get_progress(_:web.Request):
     headers = {'content-type': 'application/json; charset=utf-8',
                'cache-control': 'no-cache',
                'x-content-type-options': 'nosniff'}
-    content = json.dumps(progress)
+    content = json.dumps(list(romfiles.values()), cls=RomFileEncoder)
     return web.Response(body=content, headers=headers)
 
-async def main():
-    """ Main loop """
-    global qrcodes
+async def file_crawler():
+    """ Maintains a list of rom files that currently exist """
+    global romfiles
 
-    app=web.Application()
-    # Find rom files and create routes
-    #TODO: add support for noticing changes to the working directory
-    roms=[]
-    for typ in ['*.cia','*.3dsx']:
-        result=glob.glob(typ)
-        if result:
-            roms+=result
-    app.add_routes([web.get('/'+parse.quote_plus(f).replace('+','%20'),get_cia) for f in roms])
+    while True:
+        foundroms = []
+        for typ in ['*.cia','*.3dsx']:
+            for foundfile in glob.glob(typ):
+                foundroms.append(foundfile)
+                if foundfile and (foundfile not in romfiles):
+                    romfiles[foundfile] = RomFile(foundfile)
+                    print("Found "+foundfile)
+                    romfiles[foundfile].qrcode = generate_qr(foundfile, ip_addr)
+
+        for rom in romfiles:
+            if rom not in foundroms:
+                del romfiles[rom]
+                break # can't continue iterating once romfiles is changed
+
+        await asyncio.sleep(1)
+
+async def main():
+    """ Main process entrypoint """
+    global ip_addr
+
+    app = web.Application()
     app.router.add_get('/', get_home)
     app.router.add_get('/progress', get_progress)
+    app.router.add_get('/{file_path:.+}',get_cia)
 
-    if len(roms)<=0:
-        print('error: please place .cia files in the same directory as this script before running!')
-        return
-    print('Found '+str(len(roms))+' file(s) to share with 3ds clients.')
-    print('Open your homebrew software manager of choice (FBI) on your device',
-          'and find the scan qr code option now.\n')
-
-    ip_addr='0.0.0.0'
     if os.path.exists('ip override.txt'):
         with open('ip override.txt','r',encoding='ascii') as f:
             ip_addr=f.read()
@@ -205,6 +269,9 @@ async def main():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             ip_addr = s.getsockname()[0]
+
+    # Start the file crawler once the ip address is known
+    asyncio.ensure_future(file_crawler())
 
     print('Starting web server at '+ip_addr+':8888...')
 
@@ -218,8 +285,6 @@ async def main():
               "Try changing your ip settings by editing or deleting the 'ip override.txt' file.")
         return
     print(f'Web server running at http://{ip_addr}:8888 !\n')
-
-    qrcodes = dict((f, generate_qr(f, ip_addr)) for f in roms)
 
     print("\nDone! Scan each of these qr codes with each cracked 3ds you want them installed on!")
     print('Keep this window open in order to keep the transmission running.')
